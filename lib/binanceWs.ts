@@ -1,7 +1,7 @@
 // lib/binanceWs.ts
 import WebSocket from 'ws';
-import axios from 'axios';
 import EventEmitter from 'events';
+import { getKlines } from './binance';
 import { ema, macd, rsi } from './indicators';
 
 type KlineObj = {
@@ -18,60 +18,45 @@ type KlineObj = {
 const BINANCE_FUTURES_BASE = 'wss://fstream.binance.com/stream?streams=';
 
 export class BinanceWsManager extends EventEmitter {
-  private batches: string[][] = [];
+  private symbols: string[];
+  private timeframe: string;
+  private batchSize = 60; // tweak if needed
+  private klinesNeeded = 500;
+  private cache: Map<string, number[]> = new Map(); // symbol -> closes
   private sockets: Map<number, WebSocket> = new Map();
   private backoffs: Map<number, number> = new Map();
-  private cache: Map<string, number[]> = new Map(); // symbol -> close series (recent)
-  private klinesNeeded = 500; // store last N closes
-  private batchSize = 60; // number of streams per combined connection
-  private timerPingMs = 60_000 * 2; // 2 minutes ping (binance may not require but helps)
-  private symbols: string[] = [];
-  private timeframe: string; // e.g., '1m', '15m', '1h'
 
   constructor(symbols: string[], timeframe = '1m') {
     super();
     this.symbols = symbols;
     this.timeframe = timeframe;
-    this.makeBatches();
-  }
-
-  private makeBatches() {
-    this.batches = [];
-    for (let i = 0; i < this.symbols.length; i += this.batchSize) {
-      const chunk = this.symbols.slice(i, i + this.batchSize).map(s => `${s.toLowerCase()}@kline_${this.timeframe}`);
-      this.batches.push(chunk);
-    }
   }
 
   async init() {
-    // Pre-load historical close series for all symbols (one-time)
-    await Promise.all(this.symbols.map(s => this.fetchInitialKlines(s)));
-    // Connect all batches
-    this.batches.forEach((b, idx) => this.connectBatch(b, idx));
+    // prefetch historical closes
+    await Promise.all(this.symbols.map(s => this.fetchInitial(s)));
+    // connect batches
+    for (let i = 0; i < this.symbols.length; i += this.batchSize) {
+      const chunk = this.symbols.slice(i, i + this.batchSize).map(s => `${s.toLowerCase()}@kline_${this.timeframe}`);
+      this.connectBatch(chunk, i / this.batchSize);
+    }
   }
 
-  private async fetchInitialKlines(symbol: string) {
+  private async fetchInitial(symbol: string) {
     try {
-      const url = `https://fapi.binance.com/fapi/v1/klines?symbol=${symbol}&interval=${this.timeframe}&limit=${this.klinesNeeded}`;
-      const { data } = await axios.get(url, { timeout: 15000 });
-      const closes = data.map((k: any[]) => parseFloat(k[4]));
+      const klines = await getKlines(symbol, this.timeframe, this.klinesNeeded);
+      const closes = klines.map(k => k.close);
       this.cache.set(symbol, closes);
-   } catch (err: any) {
-  console.warn(
-    'Failed to fetch initial klines for',
-    symbol,
-    (err && typeof err === 'object' && 'message' in err) ? err.message : err
-  );
-  this.cache.set(symbol, []); // fallback
-}
-
+    } catch (err: any) {
+      console.warn('fetchInitial failed', symbol, err?.message ?? err);
+      this.cache.set(symbol, []);
+    }
   }
 
   private connectBatch(streams: string[], batchIndex: number) {
-    if (!streams || streams.length === 0) return;
+    if (!streams.length) return;
     const url = BINANCE_FUTURES_BASE + streams.join('/');
-    const ws = new WebSocket(url, { handshakeTimeout: 20000 });
-
+    const ws = new WebSocket(url);
     this.sockets.set(batchIndex, ws);
     this.backoffs.set(batchIndex, 1000);
 
@@ -79,49 +64,44 @@ export class BinanceWsManager extends EventEmitter {
 
     ws.on('open', () => {
       this.backoffs.set(batchIndex, 1000);
-      // optional ping
       if (pingTimer) clearInterval(pingTimer);
       pingTimer = setInterval(() => {
-        try {
-          ws.ping();
-        } catch (e) {}
-      }, this.timerPingMs);
-      console.log(`Binance WS batch ${batchIndex} opened (${streams.length} streams)`);
+        try { ws.ping(); } catch (e) {}
+      }, 60_000 * 2);
+      console.log(`Binance WS batch ${batchIndex} open (${streams.length})`);
     });
 
-    ws.on('message', (msg) => {
+    ws.on('message', (raw) => {
       try {
-        const parsed = JSON.parse(msg.toString());
-        // combined stream format: { stream: 'btcusdt@kline_1m', data: { ... } }
+        const parsed = JSON.parse(raw.toString());
         if (!parsed || !parsed.data) return;
         const data = parsed.data;
-        if (data.e === 'kline') {
+        if (data.e === 'kline' && data.k) {
           const k = this.parseKline(data.k);
-          const symbol = data.s; // e.g. BTCUSDT
+          const symbol = data.s;
           this.handleKline(symbol, k);
         }
-      } catch (err) {
-        // ignore parse errors
+      } catch (e) {
+        // ignore
       }
     });
 
     ws.on('close', (code, reason) => {
       if (pingTimer) clearInterval(pingTimer);
-      console.warn(`Binance WS batch ${batchIndex} closed:`, code, reason?.toString?.() || reason);
+      console.warn(`WS batch ${batchIndex} closed`, code, reason?.toString?.() ?? reason);
       this.sockets.delete(batchIndex);
       this.scheduleReconnect(streams, batchIndex);
     });
 
     ws.on('error', (err) => {
-      console.error('Binance WS error:', err?.message || err);
-      // socket 'close' will also be emitted; ensure closed
-      try { ws.terminate(); } catch (e) {}
+      console.error('WS batch error', err?.message ?? err);
+      try { ws.terminate(); } catch {}
     });
   }
 
   private scheduleReconnect(streams: string[], batchIndex: number) {
     const prev = this.backoffs.get(batchIndex) ?? 1000;
-    const next = Math.min(prev * 2, 60000); // exponential backoff up to 60s
+    const next = Math.min(prev * 2, 60_000);
     this.backoffs.set(batchIndex, next);
     setTimeout(() => this.connectBatch(streams, batchIndex), next);
   }
@@ -140,30 +120,27 @@ export class BinanceWsManager extends EventEmitter {
   }
 
   private handleKline(symbol: string, k: KlineObj) {
-    // update cache
-    const existing = this.cache.get(symbol) || [];
-    // keep length limited
-    existing.push(k.close);
-    if (existing.length > this.klinesNeeded) existing.splice(0, existing.length - this.klinesNeeded);
-    this.cache.set(symbol, existing);
+    const cur = this.cache.get(symbol) || [];
+    cur.push(k.close);
+    if (cur.length > this.klinesNeeded) cur.splice(0, cur.length - this.klinesNeeded);
+    this.cache.set(symbol, cur);
 
-    // compute indicators on the latest series when the kline closed (isFinal === true)
-    // but you may also want intra-candle updates -> remove isFinal check if needed
-    if (!k.isFinal) {
-      // optionally still emit live partials — we'll only compute on final for accuracy
-      return;
-    }
+    // compute indicators when kline closed (final)
+    if (!k.isFinal) return;
 
     const closes = this.cache.get(symbol) || [];
     if (closes.length < 2) return;
 
-    const ema12Series = ema(closes, 12);
-    const ema26Series = ema(closes, 26);
-    const ema50Series = ema(closes, 50);
-    const ema100Series = ema(closes, 100);
-    const ema200Series = ema(closes, 200);
-    const macdRes = macd(closes, 12, 26, 9);
-    const rsiRes = rsi(closes, 14);
+    const ema12 = ema(closes, 12).filter(v => v != null).slice(-1)[0] ?? null;
+    const ema26 = ema(closes, 26).filter(v => v != null).slice(-1)[0] ?? null;
+    const ema50 = ema(closes, 50).filter(v => v != null).slice(-1)[0] ?? null;
+    const ema100 = ema(closes, 100).filter(v => v != null).slice(-1)[0] ?? null;
+    const ema200 = ema(closes, 200).filter(v => v != null).slice(-1)[0] ?? null;
+    const m = macd(closes, 12, 26, 9);
+    const macdVal = m.macdLine.filter(v => v != null).slice(-1)[0] ?? null;
+    const macdSignal = m.signalLine.filter(v => v != null).slice(-1)[0] ?? null;
+    const macdHist = m.histogram.filter(v => v != null).slice(-1)[0] ?? null;
+    const rsi14 = rsi(closes, 14).filter(v => v != null).slice(-1)[0] ?? null;
 
     const payload = {
       symbol,
@@ -172,32 +149,18 @@ export class BinanceWsManager extends EventEmitter {
       low: k.low,
       close: k.close,
       volume: k.volume,
-      ema12: lastOrNull(ema12Series),
-      ema26: lastOrNull(ema26Series),
-      ema50: lastOrNull(ema50Series),
-      ema100: lastOrNull(ema100Series),
-      ema200: lastOrNull(ema200Series),
-      macd: lastOrNull(macdRes.macdLine),
-      macdSignal: lastOrNull(macdRes.signalLine),
-      macdHist: lastOrNull(macdRes.histogram),
-      rsi14: lastOrNull(rsiRes),
+      ema12,
+      ema26,
+      ema50,
+      ema100,
+      ema200,
+      macd: macdVal,
+      macdSignal,
+      macdHist,
+      rsi14,
       ts: Date.now(),
     };
 
-    // emit event for consumers (SSE endpoint will listen)
     this.emit('candle', payload);
   }
-
-  // utility to return last element or null
-  public getCachedCloses(symbol: string) {
-    return this.cache.get(symbol) || [];
-  }
 }
-
-function lastOrNull(arr: any[]) {
-  if (!arr || arr.length === 0) return null;
-  const v = arr[arr.length - 1];
-  if (v === undefined || Number.isNaN(v)) return null;
-  return v;
-}
-
