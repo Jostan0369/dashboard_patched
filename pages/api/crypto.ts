@@ -1,75 +1,89 @@
-
 import type { NextApiRequest, NextApiResponse } from 'next';
-import { pusher } from '@/lib/pusher';
-import { getFromBinance, getUSDTSymbols, getKlines } from '@/lib/binance';
-import { macd, ema, rsi } from '@/lib/indicators';
+import { getFuturesSymbols, getKlines } from '@/lib/binance';
+import { ema, macd, rsi } from '@/lib/indicators';
+
+type IndicatorPayload = {
+  symbol: string;
+  open: number;
+  high: number;
+  low: number;
+  close: number;
+  volume: number;
+  ema12?: number;
+  ema26?: number;
+  ema50?: number;
+  ema100?: number;
+  ema200?: number;
+  macd?: number;
+  macdSignal?: number;
+  macdHist?: number;
+  rsi14?: number;
+  ts: number;
+};
+
+const VALID = ['15m', '1h', '4h', '1d'];
 
 export default async function handler(req: NextApiRequest, res: NextApiResponse) {
   try {
-    const { timeframe = '1h', limit = '200' } = req.query;
-    const valid = ['1m','5m','15m','30m','1h','4h','1d','1w','1M'];
-    if (typeof timeframe !== 'string' || !valid.includes(timeframe)) {
-      return res.status(400).json({ error: 'Invalid timeframe' });
+    const timeframe = (req.query.timeframe as string) || '1h';
+    if (!VALID.includes(timeframe)) {
+      return res.status(400).json({ error: 'Invalid timeframe. Use one of 15m,1h,4h,1d' });
     }
-    const maxSymbols = Math.min(1000, parseInt(String(limit) || '200', 10) || 200);
 
-    // discover all USDT symbols from Binance
-    const allSymbols = await getUSDTSymbols();
-    // optionally sort by symbol and limit
-    const selected = allSymbols.slice(0, maxSymbols);
+    // fetch futures symbols
+    const symbols = await getFuturesSymbols();
+    // optional: limit for testing
+    const limitSymbols = typeof req.query.limit === 'string' ? parseInt(req.query.limit, 10) : symbols.length;
+    const selected = symbols.slice(0, Math.min(limitSymbols, symbols.length));
 
-    const promises = selected.map(async (symbol) => {
+    const results: IndicatorPayload[] = [];
+
+    // For each symbol, fetch klines and compute indicators
+    for (const symbol of selected) {
       try {
         const klines = await getKlines(symbol, timeframe, 500);
-        if (!klines || klines.length===0) return null;
-        const closes = klines.map(k=>k.close);
-        const latest = klines[klines.length-1];
-        // indicators
-        const ema12 = ema(closes,12).slice(-1)[0] ?? null;
-        const ema26 = ema(closes,26).slice(-1)[0] ?? null;
-        const ema50 = ema(closes,50).slice(-1)[0] ?? null;
-        const ema100 = ema(closes,100).slice(-1)[0] ?? null;
-        const ema200 = ema(closes,200).slice(-1)[0] ?? null;
-        const mac = macd(closes,12,26,9);
-        const macdVal = mac.macd.slice(-1)[0] ?? null;
-        const macdSignal = mac.signal.slice(-1)[0] ?? null;
-        const macdHist = mac.hist.slice(-1)[0] ?? null;
-        const rsi14 = rsi(closes,14).slice(-1)[0] ?? null;
+        if (!klines || klines.length === 0) continue;
+        const closes = klines.map(k => k.close);
+        const last = klines[klines.length - 1];
 
-        const payload = {
+        // compute EMA series
+        const ema12Series = ema(closes, 12);
+        const ema26Series = ema(closes, 26);
+        const ema50Series = ema(closes, 50);
+        const ema100Series = ema(closes, 100);
+        const ema200Series = ema(closes, 200);
+
+        const macdRes = macd(closes, 12, 26, 9);
+        const rsiRes = rsi(closes, 14);
+
+        const payload: IndicatorPayload = {
           symbol,
-          open: latest.open,
-          high: latest.high,
-          low: latest.low,
-          close: latest.close,
-          volume: latest.volume,
-          ema12,
-          ema26,
-          ema50,
-          ema100,
-          ema200,
-          macd: macdVal,
-          macdSignal,
-          macdHist,
-          rsi14,
-          ts: Date.now()
+          open: last.open,
+          high: last.high,
+          low: last.low,
+          close: last.close,
+          volume: last.volume,
+          ema12: ema12Series[ema12Series.length - 1] ?? null,
+          ema26: ema26Series[ema26Series.length - 1] ?? null,
+          ema50: ema50Series[ema50Series.length - 1] ?? null,
+          ema100: ema100Series[ema100Series.length - 1] ?? null,
+          ema200: ema200Series[ema200Series.length - 1] ?? null,
+          macd: macdRes.macdLine[macdRes.macdLine.length - 1] ?? null,
+          macdSignal: macdRes.signalLine[macdRes.signalLine.length - 1] ?? null,
+          macdHist: macdRes.histogram[macdRes.histogram.length - 1] ?? null,
+          rsi14: rsiRes[rsiRes.length - 1] ?? null,
+          ts: Date.now(),
         };
-        // optionally push via pusher for realtime
-        try {
-          await pusher.trigger('crypto-channel', 'price-update', payload);
-        } catch(e){
-          // ignore
-        }
-        return payload;
+        results.push(payload);
       } catch (err) {
-        return null;
+        console.error('Error processing symbol', symbol, err);
       }
-    });
+    }
 
-    const result = (await Promise.all(promises)).filter(Boolean);
-    return res.status(200).json(result);
-  } catch (err:any) {
-    console.error('crypto api error', err?.stack||err);
+    // Return all payloads
+    return res.status(200).json(results);
+  } catch (err) {
+    console.error('Unexpected error in crypto API', err);
     return res.status(500).json({ error: 'Internal server error' });
   }
 }
