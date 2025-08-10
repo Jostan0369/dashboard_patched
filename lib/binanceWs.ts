@@ -56,10 +56,15 @@ export class BinanceWsManager extends EventEmitter {
       const { data } = await axios.get(url, { timeout: 15000 });
       const closes = data.map((k: any[]) => parseFloat(k[4]));
       this.cache.set(symbol, closes);
-    } catch (err) {
-      console.warn('Failed to fetch initial klines for', symbol, err?.message || err);
-      this.cache.set(symbol, []); // fallback
-    }
+   } catch (err: any) {
+  console.warn(
+    'Failed to fetch initial klines for',
+    symbol,
+    (err && typeof err === 'object' && 'message' in err) ? err.message : err
+  );
+  this.cache.set(symbol, []); // fallback
+}
+
   }
 
   private connectBatch(streams: string[], batchIndex: number) {
@@ -195,3 +200,4 @@ function lastOrNull(arr: any[]) {
   if (v === undefined || Number.isNaN(v)) return null;
   return v;
 }
+
