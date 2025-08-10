@@ -14,6 +14,8 @@ A real-time Binance USDT Futures dashboard with live signals, indicators, and so
 ```bash
 npm install
 npm run dev
+npm install axios ws
+
 
 
 ## Added server-side indicators (EMA, MACD, RSI)
