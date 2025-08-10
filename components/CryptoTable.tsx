@@ -1,100 +1,245 @@
 // components/CryptoTable.tsx
-import React, { useEffect, useState } from "react";
+'use client'
 
-interface CryptoData {
-  symbol: string;
-  open: number;
-  high: number;
-  low: number;
-  close: number;
-  rsi: number;
-  ema12: number;
-  ema26: number;
-  macd: number;
-  ema: number;
+import React, { useEffect, useRef, useState } from 'react'
+
+type Timeframe = '15m' | '1h' | '4h' | '1d' | '1D'
+
+interface RowData {
+  symbol: string
+  open: number | null
+  high: number | null
+  low: number | null
+  close: number | null
+  volume: number | null
+  rsi14?: number | null
+  ema12?: number | null
+  ema26?: number | null
+  ema50?: number | null
+  ema100?: number | null
+  ema200?: number | null
+  macd?: number | null
+  macdSignal?: number | null
+  macdHist?: number | null
+  // legacy / other signals (kept for compatibility)
+  emaCross?: string
+  tmvSignal?: string
+  miSignal?: string
+  trendSignal?: string
+  viSignal?: string
+  volumeIn?: number | null
+  finalSignal?: string
+  ts?: number
 }
 
-const CryptoTable: React.FC = () => {
-  const [data, setData] = useState<CryptoData[]>([]);
-  const [loading, setLoading] = useState(true);
+interface CryptoTableProps {
+  timeframe: Timeframe
+  limit?: number // optional limit for testing
+}
 
-  useEffect(() => {
-    const fetchData = async () => {
-      try {
-        // ✅ Binance Futures USDT pairs
-        const res = await fetch("https://api.binance.com/api/v3/ticker/24hr");
-        const allData = await res.json();
+function formatNum(v: number | null | undefined, digits = 4) {
+  if (v === null || v === undefined || Number.isNaN(v)) return '-'
+  // handle very large/small values gracefully
+  if (Math.abs(v) >= 1000) return v.toLocaleString(undefined, { maximumFractionDigits: 0 })
+  return v.toFixed(digits)
+}
 
-        // Filter only USDT pairs
-        const filtered = allData.filter((item: any) => item.symbol.endsWith("USDT"));
+const CryptoTable: React.FC<CryptoTableProps> = ({ timeframe, limit = 200 }) => {
+  const [rows, setRows] = useState<RowData[]>([])
+  const [loading, setLoading] = useState(true)
+  const symbolIndexRef = useRef<Record<string, number>>({})
+  const esRef = useRef<EventSource | null>(null)
+  const pollingRef = useRef<number | null>(null)
 
-        // Format data (placeholder RSI, EMA, MACD values)
-        const formatted: CryptoData[] = filtered.map((item: any) => ({
-          symbol: item.symbol,
-          open: parseFloat(item.openPrice),
-          high: parseFloat(item.highPrice),
-          low: parseFloat(item.lowPrice),
-          close: parseFloat(item.lastPrice),
-          rsi: Math.random() * 100, // Replace with real calculation later
-          ema12: parseFloat(item.lastPrice), // Placeholder
-          ema26: parseFloat(item.lastPrice), // Placeholder
-          macd: 0, // Placeholder
-          ema: parseFloat(item.lastPrice), // Placeholder
-        }));
-
-        setData(formatted);
-        setLoading(false);
-      } catch (error) {
-        console.error("Error fetching data", error);
-        setLoading(false);
-      }
-    };
-
-    fetchData();
-    const interval = setInterval(fetchData, 60000); // Auto-refresh every 1 min
-    return () => clearInterval(interval);
-  }, []);
-
-  if (loading) {
-    return <div className="text-center py-4">Loading...</div>;
+  // helper: build index map from rows
+  const buildIndex = (r: RowData[]) => {
+    const map: Record<string, number> = {}
+    for (let i = 0; i < r.length; i++) map[r[i].symbol] = i
+    symbolIndexRef.current = map
   }
 
-  return (
-    <div className="overflow-x-auto">
-      <table className="min-w-full border border-gray-300">
-        <thead className="bg-gray-100">
-          <tr>
-            <th className="border px-4 py-2">Symbol</th>
-            <th className="border px-4 py-2">Open</th>
-            <th className="border px-4 py-2">High</th>
-            <th className="border px-4 py-2">Low</th>
-            <th className="border px-4 py-2">Close</th>
-            <th className="border px-4 py-2">RSI</th>
-            <th className="border px-4 py-2">EMA12</th>
-            <th className="border px-4 py-2">EMA26</th>
-            <th className="border px-4 py-2">MACD</th>
-            <th className="border px-4 py-2">EMA</th>
-          </tr>
-        </thead>
-        <tbody>
-          {data.map((coin, index) => (
-            <tr key={index} className="text-center">
-              <td className="border px-4 py-2">{coin.symbol}</td>
-              <td className="border px-4 py-2">{coin.open.toFixed(4)}</td>
-              <td className="border px-4 py-2">{coin.high.toFixed(4)}</td>
-              <td className="border px-4 py-2">{coin.low.toFixed(4)}</td>
-              <td className="border px-4 py-2">{coin.close.toFixed(4)}</td>
-              <td className="border px-4 py-2">{coin.rsi.toFixed(2)}</td>
-              <td className="border px-4 py-2">{coin.ema12.toFixed(4)}</td>
-              <td className="border px-4 py-2">{coin.ema26.toFixed(4)}</td>
-              <td className="border px-4 py-2">{coin.macd.toFixed(4)}</td>
-              <td className="border px-4 py-2">{coin.ema.toFixed(4)}</td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
-    </div>
-  );
-};
+  // fetch initial data from API (expects API that returns computed indicators)
+  const fetchInitial = async () => {
+    try {
+      setLoading(true)
+      const resp = await fetch(`/api/crypto?timeframe=${encodeURIComponent(timeframe)}&limit=${limit}`)
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`)
+      const data: RowData[] = await resp.json()
+      setRows(data)
+      buildIndex(data)
+    } catch (err) {
+      console.error('Failed to load initial data', err)
+    } finally {
+      setLoading(false)
+    }
+  }
 
-export default CryptoTable;
+  // patch a single row when update arrives
+  const patchRow = (payload: Partial<RowData> & { symbol: string }) => {
+    setRows((prev) => {
+      // shallow copy
+      const idx = symbolIndexRef.current[payload.symbol]
+      if (idx === undefined) {
+        // symbol not found — append it at the end (and update index)
+        const next = [...prev, payload as RowData]
+        buildIndex(next)
+        return next
+      }
+      const next = [...prev]
+      const existing = next[idx]
+      next[idx] = { ...existing, ...payload, ts: Date.now() }
+      return next
+    })
+  }
+
+  // Setup SSE connection (preferred) and fallback polling
+  useEffect(() => {
+    let isMounted = true
+    esRef.current = null
+    if (pollingRef.current) {
+      window.clearInterval(pollingRef.current)
+      pollingRef.current = null
+    }
+
+    // first load
+    fetchInitial()
+
+    // try SSE
+    try {
+      const url = `/api/stream?timeframe=${encodeURIComponent(timeframe)}`
+      const es = new EventSource(url)
+      esRef.current = es
+
+      es.addEventListener('candle', (ev: MessageEvent) => {
+        try {
+          // payload should match the server: { symbol, open, high, low, close, volume, ema12, ... }
+          const payload = JSON.parse(ev.data)
+          if (!payload || !payload.symbol) return
+          patchRow(payload)
+        } catch (err) {
+          // ignore malformed messages
+          console.warn('Malformed SSE candle message', err)
+        }
+      })
+
+      es.onopen = () => {
+        console.log('SSE connected for timeframe', timeframe)
+        // if previously polling, stop it
+        if (pollingRef.current) {
+          clearInterval(pollingRef.current)
+          pollingRef.current = null
+        }
+      }
+
+      es.onerror = (err) => {
+        console.warn('SSE error, falling back to polling for timeframe', timeframe, err)
+        try {
+          es.close()
+        } catch (e) {}
+        esRef.current = null
+        // fallback: poll the API every 10s
+        pollingRef.current = window.setInterval(() => {
+          if (!isMounted) return
+          fetchInitial()
+        }, 10_000)
+      }
+    } catch (err) {
+      console.warn('EventSource not available, using polling', err)
+      pollingRef.current = window.setInterval(() => {
+        if (!isMounted) return
+        fetchInitial()
+      }, 10_000)
+    }
+
+    return () => {
+      isMounted = false
+      if (esRef.current) {
+        try {
+          esRef.current.close()
+        } catch (e) {}
+        esRef.current = null
+      }
+      if (pollingRef.current) {
+        clearInterval(pollingRef.current)
+        pollingRef.current = null
+      }
+    }
+    // re-run when timeframe changes
+  }, [timeframe, limit])
+
+  return (
+    <div className="p-4 overflow-x-auto">
+      <h2 className="text-xl font-semibold mb-4">Timeframe: {timeframe}</h2>
+
+      {loading ? (
+        <div className="text-center py-6">Loading...</div>
+      ) : (
+        <table className="w-full table-auto border-collapse rounded-lg shadow-md">
+          <thead>
+            <tr className="bg-gray-800 text-white text-xs">
+              <th className="p-2">Symbol</th>
+              <th className="p-2">Open</th>
+              <th className="p-2">High</th>
+              <th className="p-2">Low</th>
+              <th className="p-2">Close</th>
+              <th className="p-2">RSI(14)</th>
+              <th className="p-2">EMA12</th>
+              <th className="p-2">EMA26</th>
+              <th className="p-2">MACD</th>
+              <th className="p-2">EMA50</th>
+              <th className="p-2">EMA100</th>
+              <th className="p-2">EMA200</th>
+              <th className="p-2">Volume</th>
+              <th className="p-2">EMA Cross</th>
+              <th className="p-2">TMV</th>
+              <th className="p-2">MI</th>
+              <th className="p-2">Trend</th>
+              <th className="p-2">VI</th>
+              <th className="p-2">Volume In</th>
+              <th className="p-2">Final Signal</th>
+            </tr>
+          </thead>
+
+          <tbody>
+            {rows.map((row) => (
+              <tr key={row.symbol} className="text-xs text-center border-b hover:bg-gray-100">
+                <td className="p-2 font-semibold">{row.symbol}</td>
+                <td className="p-2">{formatNum(row.open, 4)}</td>
+                <td className="p-2">{formatNum(row.high, 4)}</td>
+                <td className="p-2">{formatNum(row.low, 4)}</td>
+                <td className="p-2">{formatNum(row.close, 4)}</td>
+                <td className="p-2">{row.rsi14 ? row.rsi14.toFixed(2) : '-'}</td>
+                <td className="p-2">{row.ema12 ? row.ema12.toFixed(4) : '-'}</td>
+                <td className="p-2">{row.ema26 ? row.ema26.toFixed(4) : '-'}</td>
+                <td className="p-2">{row.macd ? row.macd.toFixed(4) : '-'}</td>
+                <td className="p-2">{row.ema50 ? row.ema50.toFixed(4) : '-'}</td>
+                <td className="p-2">{row.ema100 ? row.ema100.toFixed(4) : '-'}</td>
+                <td className="p-2">{row.ema200 ? row.ema200.toFixed(4) : '-'}</td>
+                <td className="p-2">{row.volume ? (row.volume / 1e6).toFixed(2) + 'M' : '-'}</td>
+                <td className="p-2">{row.emaCross ?? '-'}</td>
+                <td className="p-2">{row.tmvSignal ?? '-'}</td>
+                <td className="p-2">{row.miSignal ?? '-'}</td>
+                <td className="p-2">{row.trendSignal ?? '-'}</td>
+                <td className="p-2">{row.viSignal ?? '-'}</td>
+                <td className="p-2">{row.volumeIn ? (row.volumeIn / 1e6).toFixed(2) + 'M' : '-'}</td>
+                <td
+                  className={`p-2 font-bold ${
+                    row.finalSignal === 'BUY'
+                      ? 'text-green-600'
+                      : row.finalSignal === 'SELL'
+                      ? 'text-red-600'
+                      : 'text-gray-500'
+                  }`}
+                >
+                  {row.finalSignal ?? '-'}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+    </div>
+  )
+}
+
+export default CryptoTable
