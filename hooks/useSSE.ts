@@ -1,7 +1,7 @@
 // hooks/useSSE.ts
 import { useEffect, useRef } from 'react';
 
-export function useSSE(timeframe: string, onCandle: (data: any) => void) {
+export function useSSE(timeframe: string, onCandle: (payload: any) => void) {
   const esRef = useRef<EventSource | null>(null);
 
   useEffect(() => {
@@ -13,18 +13,16 @@ export function useSSE(timeframe: string, onCandle: (data: any) => void) {
       try {
         const data = JSON.parse(ev.data);
         onCandle(data);
-      } catch (err) {
-        // ignore
-      }
+      } catch (err) {}
     });
 
     es.onerror = (err) => {
-      // EventSource auto-reconnects, but you can inspect errors here
       console.warn('SSE error', err);
+      // EventSource auto-reconnects; we let it handle reconnection.
     };
 
     return () => {
-      try { es.close(); } catch (e) {}
+      try { es.close(); } catch {}
       esRef.current = null;
     };
   }, [timeframe, onCandle]);
