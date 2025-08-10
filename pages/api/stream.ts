@@ -1,53 +1,51 @@
 // pages/api/stream.ts
 import type { NextApiRequest, NextApiResponse } from 'next';
-import WebSocket from 'ws';
-import { pusher } from '@/lib/pusher';
+import { BinanceWsManager } from '@/lib/binanceWs';
+import { getFuturesSymbols } from '@/lib/binance';
 
-let binanceSocket: WebSocket | null = null;
+let managerInstances: Map<string, BinanceWsManager> = new Map(); // keyed by timeframe
 
 export default async function handler(req: NextApiRequest, res: NextApiResponse) {
-  if (binanceSocket) {
-    res.status(200).json({ message: '🔄 Already connected to Binance stream' });
+  // SSE headers
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache, no-transform');
+  res.setHeader('Connection', 'keep-alive');
+  res.flushHeaders();
+
+  const timeframe = (req.query.timeframe as string) || '1m';
+  const valid = ['1m', '15m', '1h', '4h', '1d'];
+  if (!valid.includes(timeframe)) {
+    res.write(`event: error\ndata: ${JSON.stringify({ error: 'Invalid timeframe' })}\n\n`);
+    res.end();
     return;
   }
 
-  console.log('🔌 Connecting to Binance miniTicker stream...');
+  // create or get manager for timeframe
+  let manager = managerInstances.get(timeframe);
+  if (!manager) {
+    // fetch futures symbols (perpetual USDT)
+    const symbols = await getFuturesSymbols();
+    manager = new BinanceWsManager(symbols, timeframe);
+    managerInstances.set(timeframe, manager);
+    manager.init().catch(err => console.error('Manager init failed', err));
+  }
 
-  binanceSocket = new WebSocket('wss://stream.binance.com:9443/ws/!miniTicker@arr');
-
-  binanceSocket.onmessage = async (event) => {
-    try {
-      const dataString = typeof event.data === 'string' ? event.data : event.data.toString();
-      const data = JSON.parse(dataString);
-
-      if (!Array.isArray(data)) return;
-
-      const usdtPairs = data.filter((d: any) => d.s?.endsWith('USDT'));
-
-      const priceMap: Record<string, number> = {};
-      for (const pair of usdtPairs) {
-        const symbol = pair.s;
-        const close = parseFloat(pair.c);
-        if (!isNaN(close)) {
-          priceMap[symbol] = close;
-        }
-      }
-
-      // Trigger Pusher event with updated prices
-      await pusher.trigger('crypto-channel', 'price-update', priceMap);
-    } catch (err) {
-      console.error('❌ WebSocket parse error:', err);
-    }
+  // Individual connection: subscribe to manager events and forward
+  const onCandle = (payload: any) => {
+    // send JSON diff (client receives and updates UI)
+    const data = JSON.stringify(payload);
+    res.write(`event: candle\ndata: ${data}\n\n`);
   };
 
-  binanceSocket.onerror = (err) => {
-    console.error('❌ Binance WebSocket error:', err);
-  };
+  manager.on('candle', onCandle);
 
-  binanceSocket.onclose = () => {
-    console.log('🔌 Binance WebSocket closed');
-    binanceSocket = null;
-  };
+  // Keep connection alive by sending a comment ping every 30s
+  const keepAlive = setInterval(() => res.write(': ping\n\n'), 30_000);
 
-  res.status(200).json({ message: '✅ Binance stream connected and Pusher active' });
+  // On client disconnect
+  req.on('close', () => {
+    clearInterval(keepAlive);
+    manager!.off('candle', onCandle);
+    // Optionally: stop manager if no listeners remain (left as improvement)
+  });
 }
