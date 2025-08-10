@@ -1,23 +1,24 @@
+// pages/api/crypto.ts
 import type { NextApiRequest, NextApiResponse } from 'next';
 import { getFuturesSymbols, getKlines } from '@/lib/binance';
 import { ema, macd, rsi } from '@/lib/indicators';
 
-type IndicatorPayload = {
+type Payload = {
   symbol: string;
   open: number;
   high: number;
   low: number;
   close: number;
   volume: number;
-  ema12?: number;
-  ema26?: number;
-  ema50?: number;
-  ema100?: number;
-  ema200?: number;
-  macd?: number;
-  macdSignal?: number;
-  macdHist?: number;
-  rsi14?: number;
+  ema12?: number | null;
+  ema26?: number | null;
+  ema50?: number | null;
+  ema100?: number | null;
+  ema200?: number | null;
+  macd?: number | null;
+  macdSignal?: number | null;
+  macdHist?: number | null;
+  rsi14?: number | null;
   ts: number;
 };
 
@@ -25,28 +26,26 @@ const VALID = ['15m', '1h', '4h', '1d'];
 
 export default async function handler(req: NextApiRequest, res: NextApiResponse) {
   try {
-    const timeframe = (req.query.timeframe as string) || '1h';
+    const timeframe = String(req.query.timeframe || '1h');
     if (!VALID.includes(timeframe)) {
-      return res.status(400).json({ error: 'Invalid timeframe. Use one of 15m,1h,4h,1d' });
+      return res.status(400).json({ error: 'Invalid timeframe' });
     }
 
-    // fetch futures symbols
+    const limitSymbols = Number(req.query.limit) || 200; // safe default while testing
+    const candlesNeeded = Number(req.query.candles) || 500; // enough for EMA200
+
     const symbols = await getFuturesSymbols();
-    // optional: limit for testing
-    const limitSymbols = typeof req.query.limit === 'string' ? parseInt(req.query.limit, 10) : symbols.length;
     const selected = symbols.slice(0, Math.min(limitSymbols, symbols.length));
 
-    const results: IndicatorPayload[] = [];
+    const out: Payload[] = [];
 
-    // For each symbol, fetch klines and compute indicators
     for (const symbol of selected) {
       try {
-        const klines = await getKlines(symbol, timeframe, 500);
+        const klines = await getKlines(symbol, timeframe, candlesNeeded);
         if (!klines || klines.length === 0) continue;
         const closes = klines.map(k => k.close);
         const last = klines[klines.length - 1];
 
-        // compute EMA series
         const ema12Series = ema(closes, 12);
         const ema26Series = ema(closes, 26);
         const ema50Series = ema(closes, 50);
@@ -54,9 +53,9 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
         const ema200Series = ema(closes, 200);
 
         const macdRes = macd(closes, 12, 26, 9);
-        const rsiRes = rsi(closes, 14);
+        const rsiSeries = rsi(closes, 14);
 
-        const payload: IndicatorPayload = {
+        const payload: Payload = {
           symbol,
           open: last.open,
           high: last.high,
@@ -71,19 +70,19 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
           macd: macdRes.macdLine[macdRes.macdLine.length - 1] ?? null,
           macdSignal: macdRes.signalLine[macdRes.signalLine.length - 1] ?? null,
           macdHist: macdRes.histogram[macdRes.histogram.length - 1] ?? null,
-          rsi14: rsiRes[rsiRes.length - 1] ?? null,
+          rsi14: rsiSeries[rsiSeries.length - 1] ?? null,
           ts: Date.now(),
         };
-        results.push(payload);
-      } catch (err) {
-        console.error('Error processing symbol', symbol, err);
+
+        out.push(payload);
+      } catch (err: any) {
+        console.warn('crypto API processing error', symbol, err?.message ?? err);
       }
     }
 
-    // Return all payloads
-    return res.status(200).json(results);
-  } catch (err) {
-    console.error('Unexpected error in crypto API', err);
+    return res.status(200).json(out);
+  } catch (err: any) {
+    console.error('crypto API error', err?.message ?? err);
     return res.status(500).json({ error: 'Internal server error' });
   }
 }
