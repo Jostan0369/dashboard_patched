@@ -28,7 +28,10 @@ const NSETabs = () => {
 
       {/* TABLE CONTENT */}
       {activeMainTab === "crypto" ? (
-  <CryptoTable timeframe="1h" />
+  <CryptoTable timeframe="15m" />
+<CryptoTable timeframe="1h" />
+<CryptoTable timeframe="4h" />
+<CryptoTable timeframe="1d" />
 ) : (
   <div className="text-center text-gray-600 py-20">📊 NSE Table Coming Soon...</div>
 )}
@@ -38,4 +41,5 @@ const NSETabs = () => {
 };
 
 export default NSETabs;
+
 
