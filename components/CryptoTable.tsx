@@ -3,15 +3,13 @@
 
 import React, { useEffect, useRef, useState } from 'react'
 
-type Timeframe = '15m' | '1h' | '4h' | '1d' | '1D'
-
 interface RowData {
   symbol: string
-  open: number | null
-  high: number | null
-  low: number | null
-  close: number | null
-  volume: number | null
+  open?: number | null
+  high?: number | null
+  low?: number | null
+  close?: number | null
+  volume?: number | null
   rsi14?: number | null
   ema12?: number | null
   ema26?: number | null
@@ -21,7 +19,7 @@ interface RowData {
   macd?: number | null
   macdSignal?: number | null
   macdHist?: number | null
-  // legacy / other signals (kept for compatibility)
+  // Optional legacy fields
   emaCross?: string
   tmvSignal?: string
   miSignal?: string
@@ -33,135 +31,136 @@ interface RowData {
 }
 
 interface CryptoTableProps {
-  timeframe: Timeframe
-  limit?: number // optional limit for testing
+  timeframe: string // keep flexible to avoid union type mismatch
+  limit?: number
 }
 
 function formatNum(v: number | null | undefined, digits = 4) {
   if (v === null || v === undefined || Number.isNaN(v)) return '-'
-  // handle very large/small values gracefully
   if (Math.abs(v) >= 1000) return v.toLocaleString(undefined, { maximumFractionDigits: 0 })
   return v.toFixed(digits)
 }
 
-const CryptoTable: React.FC<CryptoTableProps> = ({ timeframe, limit = 200 }) => {
+const CryptoTable: React.FC<CryptoTableProps> = ({ timeframe = '1h', limit = 200 }) => {
   const [rows, setRows] = useState<RowData[]>([])
   const [loading, setLoading] = useState(true)
   const symbolIndexRef = useRef<Record<string, number>>({})
-  const esRef = useRef<EventSource | null>(null)
-  const pollingRef = useRef<number | null>(null)
+  const esRef = useRef<any>(null)
+  const pollRef = useRef<number | null>(null)
 
-  // helper: build index map from rows
   const buildIndex = (r: RowData[]) => {
     const map: Record<string, number> = {}
     for (let i = 0; i < r.length; i++) map[r[i].symbol] = i
     symbolIndexRef.current = map
   }
 
-  // fetch initial data from API (expects API that returns computed indicators)
+  // Initial load
   const fetchInitial = async () => {
+    setLoading(true)
     try {
-      setLoading(true)
-      const resp = await fetch(`/api/crypto?timeframe=${encodeURIComponent(timeframe)}&limit=${limit}`)
-      if (!resp.ok) throw new Error(`HTTP ${resp.status}`)
-      const data: RowData[] = await resp.json()
+      const res = await fetch(`/api/crypto?timeframe=${encodeURIComponent(timeframe)}&limit=${limit}`)
+      if (!res.ok) throw new Error(`Initial data HTTP ${res.status}`)
+      const data = (await res.json()) as RowData[]
       setRows(data)
       buildIndex(data)
     } catch (err) {
-      console.error('Failed to load initial data', err)
+      console.error('fetchInitial error', err)
     } finally {
       setLoading(false)
     }
   }
 
-  // patch a single row when update arrives
+  // patch a single incoming payload into rows state
   const patchRow = (payload: Partial<RowData> & { symbol: string }) => {
-    setRows((prev) => {
-      // shallow copy
+    setRows(prev => {
       const idx = symbolIndexRef.current[payload.symbol]
       if (idx === undefined) {
-        // symbol not found — append it at the end (and update index)
         const next = [...prev, payload as RowData]
         buildIndex(next)
         return next
       }
       const next = [...prev]
-      const existing = next[idx]
-      next[idx] = { ...existing, ...payload, ts: Date.now() }
+      next[idx] = { ...next[idx], ...payload, ts: Date.now() }
       return next
     })
   }
 
-  // Setup SSE connection (preferred) and fallback polling
   useEffect(() => {
-    let isMounted = true
-    esRef.current = null
-    if (pollingRef.current) {
-      window.clearInterval(pollingRef.current)
-      pollingRef.current = null
+    let mounted = true
+    // cleanup any previous SSE/poll
+    if (esRef.current) {
+      try { esRef.current.close() } catch {}
+      esRef.current = null
+    }
+    if (pollRef.current) {
+      clearInterval(pollRef.current)
+      pollRef.current = null
     }
 
-    // first load
     fetchInitial()
 
-    // try SSE
-    try {
-      const url = `/api/stream?timeframe=${encodeURIComponent(timeframe)}`
-      const es = new EventSource(url)
-      esRef.current = es
+    // Safe EventSource factory (avoids TS DOM-lib errors)
+    const EventSourceClass =
+      typeof window !== 'undefined' && (window as any).EventSource ? (window as any).EventSource : null
 
-      es.addEventListener('candle', (ev: MessageEvent) => {
-        try {
-          // payload should match the server: { symbol, open, high, low, close, volume, ema12, ... }
-          const payload = JSON.parse(ev.data)
-          if (!payload || !payload.symbol) return
-          patchRow(payload)
-        } catch (err) {
-          // ignore malformed messages
-          console.warn('Malformed SSE candle message', err)
+    if (EventSourceClass) {
+      try {
+        const url = `/api/stream?timeframe=${encodeURIComponent(timeframe)}`
+        const es = new EventSourceClass(url)
+        esRef.current = es
+
+        const onCandle = (ev: MessageEvent) => {
+          try {
+            const payload = JSON.parse(ev.data)
+            if (!payload || !payload.symbol) return
+            patchRow(payload)
+          } catch (e) {
+            console.warn('Malformed SSE payload', e)
+          }
         }
-      })
 
-      es.onopen = () => {
-        console.log('SSE connected for timeframe', timeframe)
-        // if previously polling, stop it
-        if (pollingRef.current) {
-          clearInterval(pollingRef.current)
-          pollingRef.current = null
+        es.addEventListener('candle', onCandle)
+        es.onopen = () => {
+          // console.log('SSE opened', timeframe)
+          if (pollRef.current) {
+            clearInterval(pollRef.current)
+            pollRef.current = null
+          }
         }
-      }
-
-      es.onerror = (err) => {
-        console.warn('SSE error, falling back to polling for timeframe', timeframe, err)
-        try {
-          es.close()
-        } catch (e) {}
-        esRef.current = null
-        // fallback: poll the API every 10s
-        pollingRef.current = window.setInterval(() => {
-          if (!isMounted) return
+        es.onerror = (err: any) => {
+          console.warn('SSE error, falling back to polling', err)
+          try { es.close() } catch {}
+          esRef.current = null
+          // fallback to polling initial endpoint every 10s
+          pollRef.current = window.setInterval(() => {
+            if (!mounted) return
+            fetchInitial()
+          }, 10_000)
+        }
+      } catch (err) {
+        console.warn('EventSource creation failed, using polling', err)
+        pollRef.current = window.setInterval(() => {
+          if (!mounted) return
           fetchInitial()
         }, 10_000)
       }
-    } catch (err) {
-      console.warn('EventSource not available, using polling', err)
-      pollingRef.current = window.setInterval(() => {
-        if (!isMounted) return
+    } else {
+      // no EventSource available (very rare) -> poll
+      pollRef.current = window.setInterval(() => {
+        if (!mounted) return
         fetchInitial()
       }, 10_000)
     }
 
     return () => {
-      isMounted = false
+      mounted = false
       if (esRef.current) {
-        try {
-          esRef.current.close()
-        } catch (e) {}
+        try { esRef.current.close() } catch {}
         esRef.current = null
       }
-      if (pollingRef.current) {
-        clearInterval(pollingRef.current)
-        pollingRef.current = null
+      if (pollRef.current) {
+        clearInterval(pollRef.current)
+        pollRef.current = null
       }
     }
     // re-run when timeframe changes
